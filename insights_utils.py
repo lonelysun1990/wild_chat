@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -19,9 +20,12 @@ import pandas as pd
 
 
 def get_first_user_message(conv: list) -> str:
-    """Extract the first user message content from a conversation list."""
+    """Extract the first user message content from a conversation list (or numpy array)."""
     if not isinstance(conv, list):
-        return ""
+        try:
+            conv = list(conv)
+        except TypeError:
+            return ""
     for msg in conv:
         if isinstance(msg, dict) and msg.get("role") == "user":
             return (msg.get("content") or "").strip()
@@ -29,12 +33,31 @@ def get_first_user_message(conv: list) -> str:
 
 
 def get_all_user_content(conv: list, sep: str = " ") -> str:
-    """Concatenate all user message contents in order."""
+    """Concatenate all user message contents in order (conv may be list or numpy array)."""
     if not isinstance(conv, list):
-        return ""
+        try:
+            conv = list(conv)
+        except TypeError:
+            return ""
     parts = []
     for msg in conv:
         if isinstance(msg, dict) and msg.get("role") == "user":
+            c = (msg.get("content") or "").strip()
+            if c:
+                parts.append(c)
+    return sep.join(parts)
+
+
+def get_all_assistant_content(conv: list, sep: str = " ") -> str:
+    """Concatenate all assistant message contents in order (conv may be list or numpy array)."""
+    if not isinstance(conv, list):
+        try:
+            conv = list(conv)
+        except TypeError:
+            return ""
+    parts = []
+    for msg in conv:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
             c = (msg.get("content") or "").strip()
             if c:
                 parts.append(c)
@@ -130,14 +153,15 @@ def load_or_build(
 
 
 def _tfidf_matrix(texts: pd.Series, max_df: float = 0.95, min_df: int = 1):
-    """Build TF-IDF matrix. Returns (matrix, vectorizer). Uses unigrams and smaller vocab to avoid empty vocabulary / overflow."""
+    """Build TF-IDF matrix. Returns (matrix, vectorizer). Fits on non-empty docs only so vocabulary is real; empty docs get zero vector."""
     from sklearn.feature_extraction.text import TfidfVectorizer
 
-    clean = texts.fillna("").astype(str)
-    # Ensure no document is empty so we get at least one token (avoids "empty vocabulary")
-    clean = clean.apply(lambda x: x.strip() if x.strip() else "_empty_")
-    # Use unigrams only and modest max_features to avoid int32 overflow on large corpora.
-    # max_df=1.0 so we don't prune away all terms (sklearn can remove terms in >max_df fraction of docs).
+    clean = texts.fillna("").astype(str).str.strip()
+    non_empty = clean != ""
+    # Fit only on non-empty documents so we get a real vocabulary (not just "_empty_")
+    docs_to_fit = clean[non_empty]
+    if len(docs_to_fit) == 0:
+        docs_to_fit = pd.Series(["placeholder so vocabulary is non-empty"])
     vectorizer = TfidfVectorizer(
         max_df=1.0,
         min_df=min_df,
@@ -147,9 +171,8 @@ def _tfidf_matrix(texts: pd.Series, max_df: float = 0.95, min_df: int = 1):
         token_pattern=r"(?u)\b\w+\b",
     )
     try:
-        X = vectorizer.fit_transform(clean)
+        vectorizer.fit(docs_to_fit)
     except ValueError:
-        # Fallback: no stop words
         vectorizer = TfidfVectorizer(
             max_df=1.0,
             min_df=1,
@@ -158,7 +181,9 @@ def _tfidf_matrix(texts: pd.Series, max_df: float = 0.95, min_df: int = 1):
             ngram_range=(1, 1),
             token_pattern=r"(?u)\b\w+\b",
         )
-        X = vectorizer.fit_transform(clean)
+        vectorizer.fit(docs_to_fit)
+    # Transform all documents (empty ones get zero vector)
+    X = vectorizer.transform(clean.replace("", " "))
     return X, vectorizer
 
 
@@ -173,12 +198,33 @@ def run_nmf(
     Run NMF on text series. Returns (model, doc_topics, vectorizer).
     doc_topics: array of shape (n_samples, n_topics); each row sums to 1 (normalized).
     """
+    import numpy as np
     from sklearn.decomposition import NMF
     from sklearn.preprocessing import normalize
 
     X, vectorizer = _tfidf_matrix(texts, max_df=max_df, min_df=min_df)
-    nmf = NMF(n_components=n_topics, random_state=random_state).fit(X)
+    # NMF requires at least one positive entry; if X is all zeros (e.g. all empty docs), add one
+    if hasattr(X, "toarray"):
+        x_max = X.max()
+    else:
+        x_max = np.max(X)
+    if x_max <= 0:
+        X = X.copy()
+        if hasattr(X, "tolil"):
+            X = X.tolil()
+            X[0, 0] = 1.0
+            X = X.tocsr()
+        else:
+            X[0, 0] = 1.0
+    n_components = min(n_topics, X.shape[1], max(1, X.shape[0]))
+    nmf = NMF(n_components=n_components, random_state=random_state).fit(X)
     W = nmf.transform(X)
+    # Rows that are all zero get NaN after normalize; give them uniform topic distribution
+    row_sums = np.array(W.sum(axis=1)).flatten()
+    zero_rows = row_sums <= 0
+    if zero_rows.any():
+        W = np.asarray(W)
+        W[zero_rows, :] = 1.0 / W.shape[1]
     W_norm = normalize(W, norm="l1", axis=1)
     return nmf, W_norm, vectorizer
 
@@ -209,20 +255,26 @@ def run_lda(
 def get_top_terms_nmf(model, vectorizer, n: int = 10) -> dict[int, list[str]]:
     """For each topic, return top n terms by weight (NMF components)."""
     feature_names = vectorizer.get_feature_names_out()
+    if hasattr(feature_names, "tolist"):
+        feature_names = feature_names.tolist()
+    n_feat = len(feature_names)
     out = {}
     for i in range(model.components_.shape[0]):
-        top_idx = model.components_[i].argsort()[-n:][::-1]
-        out[i] = [feature_names[j] for j in top_idx]
+        top_idx = model.components_[i].argsort()[-min(n, n_feat):][::-1]
+        out[i] = [str(feature_names[j]) for j in top_idx if j < n_feat and feature_names[j]]
     return out
 
 
 def get_top_terms_lda(model, vectorizer, n: int = 10) -> dict[int, list[str]]:
     """For each topic, return top n terms by weight (LDA components)."""
     feature_names = vectorizer.get_feature_names_out()
+    if hasattr(feature_names, "tolist"):
+        feature_names = feature_names.tolist()
+    n_feat = len(feature_names)
     out = {}
     for i in range(model.components_.shape[0]):
-        top_idx = model.components_[i].argsort()[-n:][::-1]
-        out[i] = [feature_names[j] for j in top_idx]
+        top_idx = model.components_[i].argsort()[-min(n, n_feat):][::-1]
+        out[i] = [str(feature_names[j]) for j in top_idx if j < n_feat and feature_names[j]]
     return out
 
 
@@ -593,6 +645,70 @@ def label_theme_openai(
         )
         themes.extend(new_labels)
         time.sleep(0.5)
+    df.loc[missing_idx, "theme"] = themes
+    return df
+
+
+def _label_one_theme(client: Any, text: str) -> str:
+    """Label a single text for theme (used by label_theme_openai_parallel)."""
+    truncated = _truncate(text)
+    prompt = f"Select exactly one primary theme for this user message. Reply with only the label, nothing else.\n\nOptions: {THEME_OPTIONS}\n\nUser message:\n{truncated}"
+    try:
+        label = _call_chat(
+            client,
+            prompt,
+            "You are a classifier. Reply with only one of the given options.",
+        )
+        for opt in THEME_OPTIONS.replace(",", " ").split():
+            opt = opt.strip()
+            if len(opt) > 2 and opt.lower() in (label.lower() or ""):
+                label = opt
+                break
+    except Exception:
+        label = "other"
+    return label or "other"
+
+
+def label_theme_openai_parallel(
+    df: pd.DataFrame,
+    text_col: str = "first_user_text",
+    id_col: str = "conversation_id",
+    cache_path: str | Path = "insights_output/theme_labels.parquet",
+    use_cache: bool = True,
+    batch_size: int = 100,
+    max_workers: int = 10,
+) -> pd.DataFrame:
+    """
+    Add column 'theme' via OpenAI zero-shot with parallel API calls (faster).
+    Uses cache to skip already-labeled rows. max_workers limits concurrent requests.
+    """
+    df = df.copy()
+    cache_df = load_label_cache(cache_path) if use_cache else None
+    df, missing_idx = merge_cached_labels(
+        df, cache_df, id_col=id_col, label_cols=["theme"]
+    )
+    to_label = df.loc[missing_idx]
+    if len(to_label) == 0:
+        return df
+
+    client = _get_client()
+    texts = to_label[text_col].fillna("").astype(str).tolist()
+    themes: list[str] = []
+
+    for start in range(0, len(texts), batch_size):
+        end = min(start + batch_size, len(texts))
+        batch_texts = texts[start:end]
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            new_labels = list(ex.map(lambda t: _label_one_theme(client, t), batch_texts))
+        save_label_cache(
+            cache_path,
+            to_label[id_col].iloc[start:end],
+            {"theme": new_labels},
+            id_col=id_col,
+        )
+        themes.extend(new_labels)
+        time.sleep(0.2)  # short pause between batches to ease rate limits
+
     df.loc[missing_idx, "theme"] = themes
     return df
 

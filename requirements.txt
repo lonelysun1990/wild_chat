@@ -1,4 +1,4 @@
-# For WildChat EDA (explore.ipynb) and insights analysis (insights_analysis.ipynb)
+# For WildChat EDA (explore.ipynb), insights analysis (insights_analysis.ipynb), intent clustering (intent_clustering.ipynb)
 datasets>=2.14.0
 pandas>=1.5.0
 pyarrow>=10.0.0
@@ -6,3 +6,4 @@ matplotlib>=3.5.0
 openai>=1.0.0
 python-dotenv>=1.0.0
 scikit-learn>=1.2.0
+sentence-transformers>=2.2.0

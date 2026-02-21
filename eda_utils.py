@@ -5,10 +5,11 @@ Sampling (conversation-level) and table builders for steps 3–9.
 
 from __future__ import annotations
 
+import json
 import math
 import random
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -90,54 +91,60 @@ def build_step3_basic_counts(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _message_lengths_and_roles(df: pd.DataFrame):
-    """Per-conversation: n_messages, total_chars, user_lengths, assistant_lengths."""
+    """Per-conversation: n_messages, total_words, user word counts per msg, assistant word counts per msg."""
     convos = df["conversation"]
     n_msgs = []
-    total_chars = []
+    total_words = []
     user_lens = []
     asst_lens = []
 
     for conv in convos:
+        # Accept list or numpy array (e.g. from parquet)
         if not isinstance(conv, list):
-            n_msgs.append(0)
-            total_chars.append(0)
-            user_lens.append([])
-            asst_lens.append([])
-            continue
+            try:
+                conv = list(conv)
+            except TypeError:
+                n_msgs.append(0)
+                total_words.append(0)
+                user_lens.append([])
+                asst_lens.append([])
+                continue
         u_lens = []
         a_lens = []
         tot = 0
         for msg in conv:
             c = (msg.get("content") or "") if isinstance(msg, dict) else ""
-            length = len(str(c))
-            tot += length
+            word_count = len(str(c).split())
+            tot += word_count
             role = msg.get("role") if isinstance(msg, dict) else ""
             if role == "user":
-                u_lens.append(length)
+                u_lens.append(word_count)
             elif role == "assistant":
-                a_lens.append(length)
+                a_lens.append(word_count)
         n_msgs.append(len(conv))
-        total_chars.append(tot)
+        total_words.append(tot)
         user_lens.append(u_lens)
         asst_lens.append(a_lens)
 
-    return n_msgs, total_chars, user_lens, asst_lens
+    return n_msgs, total_words, user_lens, asst_lens
 
 
 def build_step4_message_length(df: pd.DataFrame) -> pd.DataFrame:
-    """Per-conversation message counts and character lengths; user vs assistant."""
-    n_msgs, total_chars, user_lens, asst_lens = _message_lengths_and_roles(df)
+    """Per-conversation message counts and word counts; user vs assistant."""
+    n_msgs, total_words, user_lens, asst_lens = _message_lengths_and_roles(df)
 
     rows = []
     for i in range(len(df)):
+        u_mean = sum(user_lens[i]) / len(user_lens[i]) if user_lens[i] else 0
+        a_mean = sum(asst_lens[i]) / len(asst_lens[i]) if asst_lens[i] else 0
         rows.append({
             "conversation_idx": i,
             "n_messages": n_msgs[i],
-            "total_chars": total_chars[i],
-            "user_mean_len": sum(user_lens[i]) / len(user_lens[i]) if user_lens[i] else 0,
-            "user_total_len": sum(user_lens[i]),
-            "assistant_mean_len": sum(asst_lens[i]) / len(asst_lens[i]) if asst_lens[i] else 0,
-            "assistant_total_len": sum(asst_lens[i]),
+            "total_words": total_words[i],
+            "user_mean_words": round(u_mean, 2),
+            "user_total_words": sum(user_lens[i]),
+            "assistant_mean_words": round(a_mean, 2),
+            "assistant_total_words": sum(asst_lens[i]),
             "n_user_msgs": len(user_lens[i]),
             "n_assistant_msgs": len(asst_lens[i]),
         })
@@ -146,19 +153,19 @@ def build_step4_message_length(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_step4_message_length_summary(step4_df: pd.DataFrame) -> pd.DataFrame:
-    """Summary stats for message length (percentiles, etc.) for display."""
+    """Summary stats for message word count (percentiles, etc.) for display."""
     all_user = []
     all_asst = []
     for _, row in step4_df.iterrows():
         if row["n_user_msgs"]:
-            all_user.append(row["user_mean_len"])
+            all_user.append(row["user_mean_words"])
         if row["n_assistant_msgs"]:
-            all_asst.append(row["assistant_mean_len"])
+            all_asst.append(row["assistant_mean_words"])
     s = pd.Series({
-        "user_mean_len_median": pd.Series(all_user).median() if all_user else 0,
-        "user_mean_len_mean": pd.Series(all_user).mean() if all_user else 0,
-        "assistant_mean_len_median": pd.Series(all_asst).median() if all_asst else 0,
-        "assistant_mean_len_mean": pd.Series(all_asst).mean() if all_asst else 0,
+        "user_mean_words_median": pd.Series(all_user).median() if all_user else 0,
+        "user_mean_words_mean": pd.Series(all_user).mean() if all_user else 0,
+        "assistant_mean_words_median": pd.Series(all_asst).median() if all_asst else 0,
+        "assistant_mean_words_mean": pd.Series(all_asst).mean() if all_asst else 0,
     })
     return s.to_frame("value").T
 
@@ -308,10 +315,10 @@ def build_step9_summary(
 
     # From step4 (use step4_df if provided)
     if step4_df is not None and len(step4_df):
-        med_user = step4_df["user_mean_len"].median()
-        mean_user = step4_df["user_mean_len"].mean()
-        med_asst = step4_df["assistant_mean_len"].median()
-        mean_asst = step4_df["assistant_mean_len"].mean()
+        med_user = step4_df["user_mean_words"].median()
+        mean_user = step4_df["user_mean_words"].mean()
+        med_asst = step4_df["assistant_mean_words"].median()
+        mean_asst = step4_df["assistant_mean_words"].mean()
     else:
         med_user = mean_user = med_asst = mean_asst = 0.0
 
@@ -373,3 +380,94 @@ def load_or_build(
     ensure_output_dir(out_path.parent)
     df.to_parquet(out_path, index=False)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Export English-only conversations (full dataset, chunked parquet)
+# ---------------------------------------------------------------------------
+
+
+def export_english_chunked_parquet(
+    dataset,
+    output_dir: str | Path,
+    chunk_size: int = 50_000,
+    language_col: str = "language",
+    language_value: str = "English",
+) -> tuple[Path, int]:
+    """
+    Filter to English conversations only and write to chunked parquet files.
+    Uses the full dataset (no sampling). Caller must pass the full train split.
+
+    Args:
+        dataset: HuggingFace Dataset (train split, full).
+        output_dir: Directory to write parquet chunks (e.g. data/english_chunks).
+        chunk_size: Max rows per parquet file.
+        language_col: Column name for language.
+        language_value: Value to keep (e.g. "English").
+
+    Returns:
+        (output_dir Path, total rows written).
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    df = dataset.to_pandas()
+    english = df[df[language_col].astype(str).str.strip().eq(language_value)]
+    total = len(english)
+    if total == 0:
+        return output_dir, 0
+    written = 0
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        chunk = english.iloc[start:end]
+        path = output_dir / f"english_{start:06d}_{end:06d}.parquet"
+        chunk.to_parquet(path, index=False)
+        written += len(chunk)
+    return output_dir, written
+
+
+def _parse_conversation_cell(val: Any) -> Any:
+    """If val is a string (e.g. JSON from parquet round-trip), parse to list of dicts; else return as-is."""
+    if val is None or (isinstance(val, list) and (not val or isinstance(val[0], dict))):
+        return val
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except (json.JSONDecodeError, TypeError):
+            import ast
+            try:
+                return ast.literal_eval(val)
+            except (ValueError, SyntaxError):
+                return val
+    return val
+
+
+def ensure_conversation_parsed(df: pd.DataFrame, conversation_col: str = "conversation") -> pd.DataFrame:
+    """
+    If the conversation column was stored as strings (e.g. after parquet round-trip),
+    parse each cell to list of dicts so extract_text_column / get_first_user_message work.
+    """
+    if conversation_col not in df.columns:
+        return df
+    out = df.copy()
+    first = out[conversation_col].dropna().iloc[0] if not out[conversation_col].isna().all() else None
+    if first is not None and isinstance(first, str):
+        out[conversation_col] = out[conversation_col].map(_parse_conversation_cell)
+    return out
+
+
+def load_english_chunked_parquet(output_dir: str | Path) -> pd.DataFrame:
+    """
+    Load all English chunked parquet files from output_dir and concatenate.
+    Expects files named english_*.parquet (from export_english_chunked_parquet).
+    Parses the conversation column from string to list-of-dicts when needed so that
+    first-user-message extraction (e.g. in insights_analysis) works correctly.
+
+    Returns:
+        DataFrame with all English conversations. Empty DataFrame if no files found.
+    """
+    output_dir = Path(output_dir)
+    paths = sorted(output_dir.glob("english_*.parquet"))
+    if not paths:
+        return pd.DataFrame()
+    df = pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
+    return ensure_conversation_parsed(df)
