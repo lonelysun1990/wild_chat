@@ -27,8 +27,9 @@ name of, what is the name, what's the name, find me, find a, website for, url fo
 **commercial_investigation** (compare before buying):  
 best, top, top 10, top 5, pricing, review, reviews, comparison, compare, versus, vs, size, color, alternative, which one, should i get, worth it, recommend, recommendation, cost, price, prices, specs, specification, specifications, rating, ratings, pros and cons, quality, reliable, durable, compare to, compared to, better than, difference between, good for, suitable for, fit for, options for, choices for, alternatives to, instead of, or should i, cheapest, affordable, value for money, user review, customer review, expert review, buying guide, product comparison, side by side.
 
-**transactional** (buy or act):  
-buy, coupon, order, purchase, cheap, price, pricing, local, store, shop, discount, cart, checkout, pay, payment, shipping, deliver, delivery, subscribe, sign up, get it, add to cart, buy now, place order, order now, purchase now, in stock, availability, where to buy, buy from, sell, selling, refund, return, promo code, voucher, deal, sale, on sale, free shipping, buy local, near me, in my area, book now, reserve, appointment, sign up for, register for.
+**transactional** (complete a purchase, booking, or paid registration—not “ask the AI to do a task”):  
+buy, coupon, order, purchase, cart, checkout, pay, payment, shipping, deliver, delivery, subscribe, sign up for [paid service/event], add to cart, buy now, place order, order now, purchase now, in stock, availability, where to buy, buy from, refund, return, promo code, voucher, deal, sale, free shipping, buy local, near me, book now, reserve, appointment, register for.  
+*(Exclude: user asking AI to create/write/build/generate content or do coding—those are informational. See [transactional_intent_analysis.md](transactional_intent_analysis.md).)*
 
 ### 1b. Expanded keywords (sub-categories)
 

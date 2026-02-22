@@ -1,10 +1,11 @@
 """
-Intent spotcheck and temporal trends for WildChat. Used by intent_spotcheck_and_trends.ipynb.
+Intent spotcheck and temporal trends for WildChat. Used by intent_spotcheck_and_trends.ipynb and intent_trends.ipynb.
 Load classified data, sample conversations per category, and plot weekly / within-week / hourly intent trends.
 """
 
 from __future__ import annotations
 
+import re
 import random
 import textwrap
 from pathlib import Path
@@ -57,6 +58,54 @@ def load_classified_for_analysis(
     df = load_classified(output_dir, full_name=full_name)
     df = ensure_conversation_parsed(df)
     df = ensure_conversation_normalized(df)
+    return df
+
+
+# Range-folder pattern: subdirs named like "0_10000", "10000_20000" (index range implied by name)
+_RANGE_SUBDIR_PATTERN = re.compile(r"^(\d+)_(\d+)$")
+
+
+def load_intent_from_range_folders(
+    output_dir: str | Path,
+    filename_tpl: str = "intent_classified_llm_{start}_{end}.parquet",
+    drop_duplicates_subset: str | list[str] | None = "conversation_id",
+) -> pd.DataFrame:
+    """
+    Load all intent-classified data from range subfolders under output_dir without duplication.
+    Subfolders are named by index range (e.g. 0_10000, 10000_20000). Each must contain
+    a parquet file named by that range (e.g. intent_classified_llm_0_10000.parquet).
+    Returns a single DataFrame with at least timestamp, intent_major, intent_sub.
+    """
+    output_dir = Path(output_dir)
+    if not output_dir.is_dir():
+        raise FileNotFoundError(f"Output dir not found: {output_dir}")
+
+    parts: list[tuple[int, int, Path]] = []
+    for p in output_dir.iterdir():
+        if not p.is_dir():
+            continue
+        m = _RANGE_SUBDIR_PATTERN.match(p.name)
+        if not m:
+            continue
+        start, end = int(m.group(1)), int(m.group(2))
+        fname = filename_tpl.format(start=start, end=end)
+        path = p / fname
+        if path.exists():
+            parts.append((start, end, path))
+
+    if not parts:
+        return pd.DataFrame()
+
+    parts.sort(key=lambda x: x[0])
+    dfs = []
+    for _start, _end, path in parts:
+        dfs.append(pd.read_parquet(path))
+    df = pd.concat(dfs, ignore_index=True)
+
+    if drop_duplicates_subset and isinstance(drop_duplicates_subset, str):
+        drop_duplicates_subset = [drop_duplicates_subset]
+    if drop_duplicates_subset and all(c in df.columns for c in drop_duplicates_subset):
+        df = df.drop_duplicates(subset=drop_duplicates_subset, keep="first")
     return df
 
 
@@ -193,8 +242,12 @@ def plot_weekly_intent_percentages(
     events: list[tuple[str, str]] | str | Path | None = None,
     stacked: bool = False,
     figsize: tuple[float, float] = (12, 6),
+    title: str | None = None,
+    total_n: int | None = None,
 ):
-    """Plot weekly intent percentages (line or stacked area). Optionally add vertical lines for events."""
+    """Plot weekly intent percentages (line or stacked area). Optionally add vertical lines for events.
+    If title is provided, use it; else if total_n is provided, use 'Intent percentage by week (N={total_n})';
+    else use default 'Intent percentage by week'."""
     import matplotlib.pyplot as plt
 
     if label_col is None:
@@ -215,7 +268,13 @@ def plot_weekly_intent_percentages(
     ax.set_xlabel("Week (period)")
     ax.set_ylabel("Percentage of conversations")
     ax.legend(title=label_col, bbox_to_anchor=(1.02, 1), loc="upper left")
-    ax.set_title("Intent percentage by week")
+    if title is not None:
+        ax.set_title(title)
+    elif total_n is not None:
+        ax.set_title(f"Intent percentage by week (N={total_n:,})")
+    else:
+        ax.set_title("Intent percentage by week")
+    ax.tick_params(axis="x", rotation=90)
     plt.tight_layout()
 
     event_list = _parse_events(events)
@@ -285,7 +344,7 @@ def plot_within_week_heatmap(
     fig, ax = plt.subplots(figsize=figsize)
     im = ax.imshow(piv.values, aspect="auto", cmap="Blues")
     ax.set_xticks(range(7))
-    ax.set_xticklabels(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+    ax.set_xticklabels(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], rotation=90)
     ax.set_yticks(range(len(piv)))
     ax.set_yticklabels(list(piv.index), fontsize=7)
     ax.set_ylabel("Week")
@@ -312,7 +371,7 @@ def plot_weekday_profile(
     fig, ax = plt.subplots(figsize=figsize)
     piv.plot(ax=ax, marker="o")
     ax.set_xticks(range(7))
-    ax.set_xticklabels(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+    ax.set_xticklabels(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], rotation=90)
     ax.set_xlabel("Day of week")
     ax.set_ylabel("Average % of conversations")
     ax.set_title("Typical week profile by intent")
@@ -374,6 +433,6 @@ def plot_hourly_intent_distribution(
     ax.set_title(f"Intent by hour of day {title_suffix}")
     ax.legend(title=label_col, bbox_to_anchor=(1.02, 1), loc="upper left")
     ax.set_xticks(range(0, 24, 2))
-    ax.set_xticklabels(range(0, 24, 2))
+    ax.set_xticklabels(range(0, 24, 2), rotation=90)
     plt.tight_layout()
     return fig, ax

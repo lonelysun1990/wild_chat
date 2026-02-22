@@ -225,10 +225,12 @@ def save_classified_by_category(
     major_col: str = "intent_major",
     sub_col: str = "intent_sub",
     full_name: str = "intent_classified.parquet",
+    chunk_size: int | None = None,
 ) -> None:
     """
     Save full classified dataframe and per-category subsets.
-    - Full: output_dir / full_name
+    - Full: output_dir / full_name (or, if chunk_size and len(df) > chunk_size,
+      output_dir / {stem}_{start}_{end}.parquet for each chunk of chunk_size rows)
     - By major: output_dir / "by_major" / {major}.parquet
     - By sub: output_dir / "by_sub" / {sub}.parquet
     """
@@ -237,8 +239,18 @@ def save_classified_by_category(
     (output_dir / "by_major").mkdir(parents=True, exist_ok=True)
     (output_dir / "by_sub").mkdir(parents=True, exist_ok=True)
 
-    out_path = output_dir / full_name
-    df.to_parquet(out_path, index=False)
+    n = len(df)
+    use_chunks = chunk_size and chunk_size > 0 and n > chunk_size
+    stem = full_name.replace(".parquet", "") if full_name.endswith(".parquet") else full_name
+
+    if use_chunks:
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            chunk_path = output_dir / f"{stem}_{start}_{end}.parquet"
+            df.iloc[start:end].to_parquet(chunk_path, index=False)
+    else:
+        out_path = output_dir / full_name
+        df.to_parquet(out_path, index=False)
 
     for major in df[major_col].dropna().unique():
         subset = df[df[major_col] == major]
@@ -252,11 +264,24 @@ def save_classified_by_category(
 
 
 def load_classified(output_dir: str | Path, full_name: str = "intent_classified.parquet") -> pd.DataFrame:
-    """Load the full classified parquet from output_dir."""
-    path = Path(output_dir) / full_name
-    if not path.exists():
-        raise FileNotFoundError(f"Classified file not found: {path}")
-    return pd.read_parquet(path)
+    """Load the full classified parquet from output_dir. If saved in chunks (stem_0_50000.parquet, ...), loads and concatenates them."""
+    import re
+
+    output_dir = Path(output_dir)
+    path = output_dir / full_name
+    if path.exists():
+        return pd.read_parquet(path)
+    stem = full_name.replace(".parquet", "") if full_name.endswith(".parquet") else full_name
+    chunk_pattern = re.compile(re.escape(stem) + r"_(\d+)_(\d+)\.parquet$")
+    chunk_paths = []
+    for f in output_dir.glob(f"{stem}_*.parquet"):
+        m = chunk_pattern.match(f.name)
+        if m:
+            chunk_paths.append((int(m.group(1)), int(m.group(2)), f))
+    if not chunk_paths:
+        raise FileNotFoundError(f"Classified file not found: {path} (and no chunk files matching {stem}_*_*.parquet)")
+    chunk_paths.sort(key=lambda x: (x[0], x[1]))
+    return pd.concat([pd.read_parquet(p) for _, _, p in chunk_paths], ignore_index=True)
 
 
 def load_category(
@@ -278,3 +303,82 @@ def load_category(
     if not path.exists():
         raise FileNotFoundError(f"Category file not found: {path}")
     return pd.read_parquet(path)
+
+
+def load_commercial_from_intent_output(
+    intent_output_dir: str | Path,
+    category: str = "commercial_investigation",
+    start_index: Optional[int] = None,
+    end_index: Optional[int] = None,
+    which: str = "major",
+) -> pd.DataFrame:
+    """
+    Load a category or subcategory from intent_output, by range or all.
+
+    which: "major" (by_major) or "sub" (by_sub). category is the intent_major or intent_sub name.
+    - If both start_index and end_index are set: discover subdirs matching \\d+_\\d+,
+      load each folder whose range overlaps [start_index, end_index), concatenate.
+    - Else: prefer intent_output_dir / "all" / by_major|by_sub / "{category}.parquet";
+      else load from all range subdirs and concatenate.
+    """
+    import re
+
+    if which not in ("major", "sub"):
+        raise ValueError(f"which must be 'major' or 'sub', got {which!r}")
+    intent_output_dir = Path(intent_output_dir)
+    safe_name = category.replace(" ", "_")
+    subdir = "by_major" if which == "major" else "by_sub"
+    category_path = f"{subdir}/{safe_name}.parquet"
+
+    # Discover range folders (e.g. 0_10000, 10000_20000)
+    range_dirs = []
+    for d in intent_output_dir.iterdir():
+        if not d.is_dir():
+            continue
+        m = re.match(r"^(\d+)_(\d+)$", d.name)
+        if m:
+            range_dirs.append((int(m.group(1)), int(m.group(2)), d))
+    range_dirs.sort(key=lambda x: (x[0], x[1]))
+
+    if start_index is not None and end_index is not None:
+        # Load only folders whose range [s, e) overlaps [start_index, end_index)
+        overlapping = [
+            (s, e, d)
+            for s, e, d in range_dirs
+            if s < end_index and e > start_index
+        ]
+        if not overlapping:
+            raise FileNotFoundError(
+                f"No range folders under {intent_output_dir} overlap [{start_index}, {end_index}). "
+                f"Found folders: {[(s, e) for s, e, _ in range_dirs]}."
+            )
+        dfs = []
+        for s, e, d in overlapping:
+            path = d / subdir / f"{safe_name}.parquet"
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"Category file not found: {path}. Run intent_classification_llm for range {d.name} first."
+                )
+            dfs.append(pd.read_parquet(path))
+        return pd.concat(dfs, ignore_index=True)
+
+    # Load everything: prefer "all" if present
+    all_path = intent_output_dir / "all" / category_path
+    if all_path.exists():
+        return pd.read_parquet(all_path)
+
+    if not range_dirs:
+        raise FileNotFoundError(
+            f"No range folders (e.g. 0_10000) or 'all' found under {intent_output_dir}. "
+            f"Run intent_classification_llm first."
+        )
+    dfs = []
+    for _s, _e, d in range_dirs:
+        path = d / subdir / f"{safe_name}.parquet"
+        if path.exists():
+            dfs.append(pd.read_parquet(path))
+    if not dfs:
+        raise FileNotFoundError(
+            f"No {category_path} found in any range folder under {intent_output_dir}."
+        )
+    return pd.concat(dfs, ignore_index=True)

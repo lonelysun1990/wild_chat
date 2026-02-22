@@ -45,8 +45,11 @@ def sample_by_conversation(
         k = max(1, math.ceil(size * pct))
         k = min(k, size)
     else:
-        k = min(5000, size)
+        # Both None: use full dataset (no sampling)
+        k = size
 
+    if k >= size:
+        return dataset
     rng = random.Random(seed)
     indices = rng.sample(range(size), k=k)
     return dataset.select(indices)
