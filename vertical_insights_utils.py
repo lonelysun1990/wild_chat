@@ -159,6 +159,23 @@ def table_brand_engagement_by_category(
     return g.reset_index()
 
 
+def table_vertical_distribution_by_category(
+    df: pd.DataFrame,
+    category_col: str = "category",
+    vertical_col: str = "vertical_tier1_llm",
+) -> pd.DataFrame:
+    """
+    Per (category, vertical): count and percentage within category.
+    Columns: category, vertical_tier1_llm (or vertical_col), count, pct.
+    """
+    if category_col not in df.columns or vertical_col not in df.columns:
+        return pd.DataFrame()
+    g = df.groupby([category_col, vertical_col]).size().reset_index(name="count")
+    cat_totals = g.groupby(category_col)["count"].transform("sum")
+    g["pct"] = (g["count"] / cat_totals.replace(0, np.nan) * 100).round(2)
+    return g
+
+
 def table_follow_up_pct_by_vertical(
     df: pd.DataFrame,
     follow_up_col: str = "any_user_follow_up_on_brand",
@@ -278,7 +295,7 @@ def plot_conversation_length_survival_by_vertical(
     n_messages_col: str = "n_messages",
     category_col: str = "category",
     vertical_col: str = "vertical_tier1_llm",
-    figsize: tuple[float, float] = (10, 6),
+    figsize: tuple[float, float] = (5, 5),
     max_curves_per_plot: int = 10,
 ) -> list["matplotlib.figure.Figure"]:
     """
@@ -350,16 +367,18 @@ def plot_deal_size_by_vertical(
         ax.set_title(title)
         return fig
 
+    # Rank verticals by mean deal size (high to low); top of plot = highest mean
+    mean_by_vert = valid.groupby(vertical_col)[deal_col].mean().sort_values(ascending=False)
+    verts_ordered = mean_by_vert.index.tolist()
+    data = [valid[valid[vertical_col] == v][deal_col].values for v in verts_ordered]
+
     fig, ax = plt.subplots(figsize=figsize)
-    verts = valid[vertical_col].unique()
-    data = [valid[valid[vertical_col] == v][deal_col].values for v in verts]
-    ax.boxplot(data, labels=verts, patch_artist=True)
+    ax.boxplot(data, labels=verts_ordered, patch_artist=True, vert=False)
     if use_log_scale:
-        ax.set_yscale("log")
-    ax.set_ylabel("Deal size (USD)")
-    ax.set_xlabel("Business vertical")
+        ax.set_xscale("log")
+    ax.set_xlabel("Deal size (USD)")
+    ax.set_ylabel("Business vertical")
     ax.set_title(title)
-    plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
     return fig
 
@@ -371,7 +390,7 @@ def plot_deal_size_by_vertical_per_category(
     vertical_col: str = "vertical_tier1_llm",
     total_brands_col: str = "total_brands",
     require_has_brand: bool = True,
-    figsize: tuple[float, float] = (10, 5),
+    figsize: tuple[float, float] = (5, 5),
     use_log_scale: bool = True,
 ) -> list["matplotlib.figure.Figure"]:
     """One box plot of deal size by vertical per category. Returns list of figures."""
@@ -424,12 +443,56 @@ def plot_brand_engagement_by_category(
     return fig
 
 
+def plot_vertical_distribution_per_category(
+    df: pd.DataFrame,
+    category_col: str = "category",
+    vertical_col: str = "vertical_tier1_llm",
+    figsize: tuple[float, float] = (5, 5),
+    top_n: Optional[int] = None,
+) -> list["matplotlib.figure.Figure"]:
+    """
+    One horizontal bar chart per category: count (and % within category) per business vertical.
+    Returns list of figures. If top_n is set, only the top_n verticals by count per category are shown.
+    """
+    import matplotlib.pyplot as plt
+
+    if category_col not in df.columns or vertical_col not in df.columns:
+        return [_create_empty_figure(figsize)]
+
+    tbl = table_vertical_distribution_by_category(df, category_col=category_col, vertical_col=vertical_col)
+    if tbl.empty:
+        return [_create_empty_figure(figsize)]
+
+    figures: list["matplotlib.figure.Figure"] = []
+    for cat in tbl[category_col].dropna().unique():
+        sub = tbl[tbl[category_col] == cat].copy()
+        if top_n is not None:
+            sub = sub.nlargest(top_n, "count")
+        sub = sub.sort_values("count", ascending=True)
+        if sub.empty:
+            figures.append(_create_empty_figure(figsize))
+            continue
+        fig, ax = plt.subplots(figsize=figsize)
+        y_pos = range(len(sub))
+        ax.barh(y_pos, sub["count"])
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(sub[vertical_col].astype(str))
+        ax.set_xlabel("Conversation count")
+        ax.set_ylabel("Business vertical")
+        ax.set_title(f"Vertical distribution — {cat} (n={sub['count'].sum():.0f})")
+        for i, (_, row) in enumerate(sub.iterrows()):
+            ax.text(row["count"] + max(sub["count"]) * 0.01, i, f"{row['pct']:.1f}%", va="center", fontsize=8)
+        plt.tight_layout()
+        figures.append(fig)
+    return figures if figures else [_create_empty_figure(figsize)]
+
+
 def plot_follow_up_pct_by_vertical_per_category(
     df: pd.DataFrame,
     category_col: str = "category",
     follow_up_col: str = "any_user_follow_up_on_brand",
     vertical_col: str = "vertical_tier1_llm",
-    figsize: tuple[float, float] = (10, 5),
+    figsize: tuple[float, float] = (5, 5),
 ) -> list["matplotlib.figure.Figure"]:
     """One bar chart of follow-up % by vertical per category. Returns list of figures."""
     import matplotlib.pyplot as plt
